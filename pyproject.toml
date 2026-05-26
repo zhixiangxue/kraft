@@ -13,6 +13,14 @@ dependencies = [
     "python-frontmatter>=1",
 ]
 
+[project.optional-dependencies]
+# Pulled in only when running examples/ scripts (e.g. `uv sync --extra examples`).
+# Kept out of core deps so library users aren't forced to install rich just to
+# call kraft() — the library itself does no terminal-pretty-printing.
+examples = [
+    "rich>=13",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

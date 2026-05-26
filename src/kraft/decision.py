@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kraft.skill import Report
+from kraft.skill import Evaluation
 
 
 @dataclass
@@ -32,11 +32,11 @@ class Verdict:
     kept_iter: int  # which iteration's skill to use; -1 when REFINE
 
 
-def decide(history: list[Report], th: Thresholds = Thresholds()) -> Verdict:
+def decide(history: list[Evaluation], th: Thresholds = Thresholds()) -> Verdict:
     """Determine whether to keep, refine, or discard the skill.
 
     Args:
-        history: Chronological list of Reports. Latest is history[-1].
+        history: Chronological list of Evaluations. Latest is history[-1].
                  First call has len(history) == 1.
         th: Tunable thresholds.
 
@@ -78,10 +78,10 @@ def decide(history: list[Report], th: Thresholds = Thresholds()) -> Verdict:
     #    Otherwise MAX_ITER (→ discard at recommendation layer).
     if len(history) >= th.max_iter:
         best = _best_iter(history)
-        best_report = history[best]
-        best_lift = best_report.lift
-        best_skill = best_report.pass_rate_with_skill
-        best_ratio = best_report.cost_ratio
+        best_eval = history[best]
+        best_lift = best_eval.lift
+        best_skill = best_eval.pass_rate_with_skill
+        best_ratio = best_eval.cost_ratio
         best_pass_ok = (
             best_lift >= th.beta_lift_min
             and best_skill >= th.gamma_skill_min
@@ -115,9 +115,9 @@ def decide(history: list[Report], th: Thresholds = Thresholds()) -> Verdict:
         prev_lift = history[-2].lift
         if abs(lift - prev_lift) < th.epsilon_plateau:
             best = _best_iter(history)
-            best_report = history[best]
-            best_lift = best_report.lift
-            best_skill = best_report.pass_rate_with_skill
+            best_eval = history[best]
+            best_lift = best_eval.lift
+            best_skill = best_eval.pass_rate_with_skill
             best_pass_ok = (
                 best_lift >= th.beta_lift_min
                 and best_skill >= th.gamma_skill_min
@@ -152,7 +152,7 @@ def decide(history: list[Report], th: Thresholds = Thresholds()) -> Verdict:
     )
 
 
-def _best_iter(history: list[Report]) -> int:
+def _best_iter(history: list[Evaluation]) -> int:
     """Pick iteration with highest with_skill pass_rate; ties go to earlier (cheaper)."""
     return max(
         range(len(history)),

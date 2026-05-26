@@ -1,24 +1,18 @@
-"""Test case generation: corner-case-biased from task, trace, or both."""
+"""Evaluation case generation: corner-case-biased from task, trace, or both."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List
 
 import chak
 from pydantic import BaseModel, Field
 
-from kraft.skill import TestCase
-
-_PROMPTS_DIR = Path(__file__).parent / "prompts"
-
-
-def _load_prompt(name: str) -> str:
-    return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+from kraft import prompts as P
+from kraft.skill import EvalCase
 
 
 class _GeneratedCase(BaseModel):
-    """Schema for LLM-generated test cases (chak structured output)."""
+    """Schema for LLM-generated evaluation cases (chak structured output)."""
 
     input: str = Field(description="The question/prompt to give the model under test")
     reference: str = Field(description="The correct/expected output")
@@ -29,12 +23,12 @@ class _GeneratedCase(BaseModel):
 class _CaseList(BaseModel):
     """Container model — OpenAI structured output requires top-level object."""
 
-    cases: list[_GeneratedCase] = Field(description="List of generated test cases")
+    cases: list[_GeneratedCase] = Field(description="List of generated evaluation cases")
 
 
-def _to_test_cases(items: list[_GeneratedCase], source: str = "synthetic") -> list[TestCase]:
+def _to_eval_cases(items: list[_GeneratedCase], source: str = "synthetic") -> list[EvalCase]:
     return [
-        TestCase(
+        EvalCase(
             input=item.input,
             reference=item.reference,
             criterion=item.criterion,
@@ -44,31 +38,38 @@ def _to_test_cases(items: list[_GeneratedCase], source: str = "synthetic") -> li
     ]
 
 
-async def from_task(task: str, model: str, api_key: str, n: int = 8) -> list[TestCase]:
-    """Generate corner-case-biased test cases from a task description."""
-    prompt = _load_prompt("tests_corner_case.md").format(task=task, n=n)
-    result = await chak.Conversation(model, api_key).asend(prompt, returns=_CaseList)
-    return _to_test_cases(result.cases if result else [])
+async def from_task(task: str, model: str, api_key: str, n: int = 8) -> tuple[list[EvalCase], int]:
+    """Generate corner-case-biased evaluation cases from a task description.
+
+    Returns ``(cases, tokens_used)`` so the caller can fold token cost into
+    its run-level usage accounting.
+    """
+    prompt = P.tests_corner_case(task=task, n=n)
+    conv = chak.Conversation(model, api_key)
+    result = await conv.asend(prompt, returns=_CaseList)
+    return _to_eval_cases(result.cases if result else []), conv.stats()["total_tokens"]
 
 
 async def from_trace(
-    trace_summary: str, real_cases: list[TestCase], model: str, api_key: str, n: int = 4
-) -> list[TestCase]:
+    trace_summary: str, real_cases: list[EvalCase], model: str, api_key: str, n: int = 4
+) -> tuple[list[EvalCase], int]:
     """Generate adversarial variants based on a trace summary.
 
     real_cases are already extracted from the trace (ground truth).
     This function generates additional synthetic corner cases.
     """
-    prompt = _load_prompt("tests_from_trace.md").format(trace=trace_summary, n=n)
-    result = await chak.Conversation(model, api_key).asend(prompt, returns=_CaseList)
-    return real_cases + _to_test_cases(result.cases if result else [])
+    prompt = P.tests_from_trace(trace=trace_summary, n=n)
+    conv = chak.Conversation(model, api_key)
+    result = await conv.asend(prompt, returns=_CaseList)
+    return real_cases + _to_eval_cases(result.cases if result else []), conv.stats()["total_tokens"]
 
 
 async def from_task_and_trace(
-    task: str, trace_summary: str, real_cases: list[TestCase], model: str, api_key: str, n: int = 8
-) -> list[TestCase]:
-    """Generate tests combining task description and trace data."""
+    task: str, trace_summary: str, real_cases: list[EvalCase], model: str, api_key: str, n: int = 8
+) -> tuple[list[EvalCase], int]:
+    """Generate evaluation cases combining task description and trace data."""
     synthetic_n = max(1, n - len(real_cases))
-    prompt = _load_prompt("tests_corner_case.md").format(task=task, n=synthetic_n)
-    result = await chak.Conversation(model, api_key).asend(prompt, returns=_CaseList)
-    return real_cases + _to_test_cases(result.cases if result else [])
+    prompt = P.tests_corner_case(task=task, n=synthetic_n)
+    conv = chak.Conversation(model, api_key)
+    result = await conv.asend(prompt, returns=_CaseList)
+    return real_cases + _to_eval_cases(result.cases if result else []), conv.stats()["total_tokens"]

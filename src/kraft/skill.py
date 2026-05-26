@@ -1,17 +1,53 @@
-"""Core data models: Skill, TestCase, RunResult, Report."""
+"""Core data models: Skill, EvalCase, EvalResult, Evaluation.
+
+Skill is **directory-native**: its on-disk form is a directory containing
+SKILL.md (required) plus arbitrary supporting files (scripts/, references/, …).
+The in-memory Skill object is just a typed view over that directory — there is
+no separate "string" representation. This aligns with chak's ClaudeSkill, which
+also takes a directory.
+"""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import frontmatter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
-class TestCase(BaseModel):
-    """A single test case with reference answer for LLM-as-judge verification."""
+class TokenUsage(BaseModel):
+    """Run-level token accounting, partitioned by phase.
+
+    Two top-level buckets matching the user-facing mental model:
+      - generation = case_gen + authoring  (everything that *produces* the skill)
+      - evaluation = eval_arms + judging   (everything that *measures* it)
+
+    Sub-buckets are kept so the summary table can break down where the cost
+    actually lands; e.g. heavy ``judging`` vs ``eval_arms`` tells you whether
+    LLM-as-judge or the case runs are dominating evaluation cost.
+    """
+
+    case_gen: int = 0     # cases.from_task / from_trace
+    authoring: int = 0    # _run_author_agent (generate + refine)
+    eval_arms: int = 0    # _run_one (with_skill + baseline answer rounds)
+    judging: int = 0      # llm_judge
+
+    @property
+    def generation(self) -> int:
+        return self.case_gen + self.authoring
+
+    @property
+    def evaluation(self) -> int:
+        return self.eval_arms + self.judging
+
+    @property
+    def total(self) -> int:
+        return self.generation + self.evaluation
+
+
+class EvalCase(BaseModel):
+    """A single evaluation case with reference answer for LLM-as-judge verification."""
 
     input: str
     reference: str
@@ -19,23 +55,30 @@ class TestCase(BaseModel):
     source: str  # "synthetic" | "trace:line42"
 
 
-class RunResult(BaseModel):
-    """Result of running a single test case."""
+class EvalResult(BaseModel):
+    """Result of running a single evaluation case."""
 
-    case: TestCase
+    case: EvalCase
     output: str  # full raw output, never truncated
     passed: bool
     tokens: int  # cumulative input + output tokens for the conversation
     latency_ms: int
 
 
-class Report(BaseModel):
-    """Evaluation report comparing baseline vs with-skill runs."""
+class Evaluation(BaseModel):
+    """Result of one evaluation round: cases + with-skill results + baseline
+    results + decision context. Persisted as ``evaluation.json``."""
 
-    with_skill: list[RunResult]
-    baseline: list[RunResult]
+    with_skill: list[EvalResult]
+    baseline: list[EvalResult]
     iter: int
     recommendation: str = ""  # filled after decision: "keep" | "discard" | "no-skill-needed"
+    # Decision context — makes evaluation.json self-explanatory. ``verdict``
+    # carries state/reason/kept_iter from kraft.decision.Verdict; ``thresholds``
+    # records the gate values that produced the verdict, so a reader can
+    # reproduce the decision from a single file (no separate verdict.json).
+    verdict: dict | None = None
+    thresholds: dict | None = None
 
     @property
     def pass_rate_with_skill(self) -> float:
@@ -54,7 +97,7 @@ class Report(BaseModel):
         return self.pass_rate_with_skill - self.pass_rate_baseline
 
     @property
-    def failures(self) -> list[RunResult]:
+    def failures(self) -> list[EvalResult]:
         """Failed cases from with_skill runs (used by refine)."""
         return [r for r in self.with_skill if not r.passed]
 
@@ -91,59 +134,90 @@ class Report(BaseModel):
             cost_tag = "⚠️ high"
         else:
             cost_tag = "ok"
-        return (
+        head = (
             f"baseline {base:.0%} → {skill:.0%} ({self.lift:+.0%}) | "
             f"cost_ratio {ratio:.2f}× [{cost_tag}] | "
             f"recommendation: {self.recommendation}"
         )
+        # Surface the decision reason so a glance at summary() answers
+        # "why this recommendation?" — no need to inspect evaluation.json.
+        if self.verdict and self.verdict.get("reason"):
+            head += f"\n  reason: {self.verdict['reason']}"
+        return head
 
 
 class Skill(BaseModel):
-    """A skill with YAML frontmatter metadata and markdown body."""
+    """A skill rooted at a directory.
 
-    name: str  # kebab-case, e.g. "cron-expressions"
-    description: str = Field(max_length=200)
-    body: str  # markdown content
-    report: Report | None = None
+    The directory MUST contain SKILL.md with YAML frontmatter (name + description
+    are required). It MAY also contain supporting files — scripts/, references/,
+    examples/ — that the runtime exposes via Layer 3 progressive disclosure.
+
+    There is no `parse(text)` / `render()` API anymore: the directory IS the
+    skill. Construct via `Skill.from_dir(path)`. Persistence is handled by
+    Kraft's Store, which writes the chosen iteration's files directly into
+    the developer-supplied ``skill_dir`` — callers no longer need to copy.
+    """
+
+    dir: Path
+    evaluation: Evaluation | None = None
+    usage: TokenUsage | None = None  # run-level token cost; populated by Kraft.run()
+
+    # ---- factories ---------------------------------------------------------
 
     @classmethod
-    def parse(cls, text: str) -> Skill:
-        """Parse YAML frontmatter + markdown body into a Skill."""
-        post = frontmatter.loads(text)
-        desc = str(post.metadata.get("description", ""))
-        if len(desc) > 200:
-            desc = desc[:197] + "..."
-        return cls(
-            name=post.metadata.get("name", ""),
-            description=desc,
-            body=post.content,
+    def from_dir(cls, dir: str | Path) -> "Skill":
+        """Bind a Skill to an existing directory containing SKILL.md."""
+        d = Path(dir).resolve()
+        if not d.is_dir():
+            raise FileNotFoundError(f"Skill directory not found: {d}")
+        if not (d / "SKILL.md").is_file():
+            raise FileNotFoundError(f"SKILL.md not found in {d}")
+        skill = cls(dir=d)
+        # Validate frontmatter eagerly — fail fast on malformed authoring.
+        meta = skill._frontmatter()
+        if not meta.get("name"):
+            raise ValueError(f"SKILL.md missing 'name' in frontmatter: {d}")
+        if not meta.get("description"):
+            raise ValueError(f"SKILL.md missing 'description' in frontmatter: {d}")
+        return skill
+
+    # ---- views over disk ---------------------------------------------------
+
+    def _frontmatter(self) -> dict[str, Any]:
+        post = frontmatter.loads(
+            (self.dir / "SKILL.md").read_text(encoding="utf-8")
         )
+        return dict(post.metadata)
+
+    @property
+    def name(self) -> str:
+        return str(self._frontmatter().get("name", ""))
+
+    @property
+    def description(self) -> str:
+        return str(self._frontmatter().get("description", ""))
+
+    @property
+    def body(self) -> str:
+        """Markdown body of SKILL.md (frontmatter stripped)."""
+        post = frontmatter.loads(
+            (self.dir / "SKILL.md").read_text(encoding="utf-8")
+        )
+        return post.content
 
     def render(self) -> str:
-        """Serialize to SKILL.md text (YAML frontmatter + body)."""
-        post = frontmatter.Post(self.body)
-        post.metadata["name"] = self.name
-        post.metadata["description"] = self.description
-        return frontmatter.dumps(post)
+        """Full SKILL.md text (frontmatter + body), as written on disk."""
+        return (self.dir / "SKILL.md").read_text(encoding="utf-8")
 
-    def materialize(self, dir: Path) -> Path:
-        """Write SKILL.md to dir/SKILL.md and return dir.
-
-        Used before evaluate — ClaudeSkill(str(dir)) needs a directory.
-        """
-        dir.mkdir(parents=True, exist_ok=True)
-        (dir / "SKILL.md").write_text(self.render(), encoding="utf-8")
-        return dir
-
-    def save(self, dir: str | Path) -> None:
-        """Write SKILL.md + report.json to target directory for production use."""
-        dir = Path(dir)
-        dir.mkdir(parents=True, exist_ok=True)
-        (dir / "SKILL.md").write_text(self.render(), encoding="utf-8")
-        if self.report:
-            (dir / "report.json").write_text(
-                self.report.model_dump_json(indent=2), encoding="utf-8"
-            )
+    def files(self) -> list[Path]:
+        """All non-SKILL.md files, as paths relative to self.dir."""
+        out: list[Path] = []
+        skill_md = self.dir / "SKILL.md"
+        for p in self.dir.rglob("*"):
+            if p.is_file() and p.resolve() != skill_md.resolve():
+                out.append(p.relative_to(self.dir))
+        return sorted(out)
 
 
 def total_tokens(resp: Any) -> int:
