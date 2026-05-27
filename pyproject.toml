@@ -28,12 +28,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/kraft"]
 
-[tool.uv]
-environments = [
-    "sys_platform == 'darwin'",
-    "sys_platform == 'linux'",
-]
-
 [[tool.uv.index]]
 name = "aliyun"
 url = "https://mirrors.aliyun.com/pypi/simple/"

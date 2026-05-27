@@ -1,6 +1,7 @@
 """Smoke test: generate and verify a skill for cron expression conversion."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,7 @@ async def main():
         task="convert natural language to cron expressions",
         skill_dir=skill_dir,
         model="openai/gpt-4o-mini",
+        api_key=os.environ["OPENAI_API_KEY"],
         overwrite=True,  # smoke test — always start fresh
     )
 

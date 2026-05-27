@@ -36,6 +36,7 @@ evaluation runtime aligned with the skill's intended deployment runtime.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import time
 from dataclasses import asdict
@@ -46,10 +47,10 @@ import chak
 from chak.tools.skills import ClaudeSkill
 from chak.tools.std import Bash, FileSystem, Python
 
-from kraft import cases
+from kraft import cases as cases_mod
 from kraft import prompts as P
 from kraft.decision import Thresholds, Verdict, decide
-from kraft.skill import EvalCase, EvalResult, Evaluation, Skill, TokenUsage, total_tokens
+from kraft.skill import EvalCase, EvalResult, Evaluation, PhaseTokens, Skill, TokenUsage, io_tokens
 from kraft.evaluator import llm_judge
 
 # Note on tool-call iteration cap:
@@ -75,13 +76,26 @@ def _copy_tree(src: Path, dst: Path) -> None:
             shutil.copy2(s, d)
 
 
+def _dump_conv(conv: chak.Conversation, path: Path) -> None:
+    """Persist a conversation's full message log as JSON.
+
+    Uses chak's ``Conversation.dump()`` which serialises every message
+    (system / user / assistant / tool) into a list of plain dicts. The file
+    sits under the run's history directory so a reader can audit exactly
+    what was sent and received for every billable token.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = conv.dump()
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 async def kraft(
     *,
     skill_dir: str | Path,
     task: str | None = None,
     trace: str | None = None,
     model: str,
-    api_key: str | None = None,
+    api_key: str,
     judge_model: str | None = None,
     judge_api_key: str | None = None,
     overwrite: bool = False,
@@ -91,10 +105,17 @@ async def kraft(
     """Top-level one-liner: generate a skill, verify it, return it.
 
     ``skill_dir``       — required. Final SKILL.md (+ scripts/) lands here.
+    ``api_key``         — **required**. The library does not read environment
+                          variables on your behalf — the caller is
+                          responsible for sourcing the credential (e.g. via
+                          ``os.environ["OPENAI_API_KEY"]``). This keeps the
+                          provider → env-var mapping explicit at the boundary
+                          rather than buried in library internals.
     ``overwrite``       — if False (default) and ``skill_dir`` is non-empty,
                           raises FileExistsError. Pass True to clobber.
-    ``judge_api_key``   — only needed when ``judge_model`` is on a different
-                          provider than ``model``. Otherwise auto-resolved.
+    ``judge_api_key``   — required when ``judge_model`` is on a different
+                          provider than ``model``; reuses ``api_key`` when
+                          judge and candidate share a provider.
     ``scripts_enabled`` — False (default): pure-prose SKILL.md only.
                           True: author may add scripts/ references/ examples/.
 
@@ -114,6 +135,168 @@ async def kraft(
     ).run(task=task, trace=trace)
 
 
+async def evaluate(
+    *,
+    skill_dir: str | Path,
+    model: str,
+    api_key: str,
+    cases: list[str] | list[EvalCase] | None = None,
+    n_cases: int = 10,
+    judge_model: str | None = None,
+    judge_api_key: str | None = None,
+    scripts_enabled: bool = False,
+) -> Skill:
+    """Evaluate an existing skill without authoring or refinement.
+
+    Use this to quickly assess whether a skill (e.g. downloaded from a
+    marketplace or generated externally) is effective. The function runs
+    a single baseline-vs-with-skill comparison and returns the Skill with
+    evaluation metrics attached.
+
+    ``skill_dir``       — must exist and contain SKILL.md.
+    ``cases``           — evaluation cases. Three modes:
+                          * ``None`` (default): auto-generate from SKILL.md
+                            content, producing ``n_cases`` synthetic cases.
+                          * ``list[str]``: natural-language descriptions;
+                            kraft structures them via LLM. Cases where the
+                            expected output cannot be inferred are discarded.
+                          * ``list[EvalCase]``: pre-structured; used as-is.
+    ``n_cases``         — number of cases to auto-generate (ignored when
+                          ``cases`` is provided).
+    ``scripts_enabled`` — controls tool injection symmetry during evaluation.
+    """
+    skill = Skill.from_dir(skill_dir)
+    usage = TokenUsage()
+
+    # Resolve judge credentials.
+    _judge_model = judge_model or model
+    if judge_api_key is not None:
+        _judge_api_key = judge_api_key
+    elif _judge_model == model:
+        _judge_api_key = api_key
+    else:
+        raise ValueError(
+            f"judge_model={_judge_model!r} differs from model={model!r}; "
+            "pass judge_api_key explicitly."
+        )
+
+    # --- Resolve cases --------------------------------------------------------
+    eval_cases: list[EvalCase]
+
+    if cases is None:
+        # Auto-generate from SKILL.md full text.
+        task_text = skill.render()
+        eval_cases, conv = await cases_mod.from_task(task_text, model, api_key, n=n_cases)
+        usage.case_gen.add_conv(conv)
+    elif cases and isinstance(cases[0], str):
+        # Natural language → structured via LLM.
+        eval_cases, conv = await cases_mod.from_natural_language(
+            cases, model, api_key  # type: ignore[arg-type]
+        )
+        usage.case_gen.add_conv(conv)
+    else:
+        # Already structured EvalCase objects.
+        eval_cases = list(cases)  # type: ignore[arg-type]
+
+    if not eval_cases:
+        raise ValueError(
+            "No valid evaluation cases available. If you provided natural-language "
+            "cases, ensure each describes an expected output."
+        )
+
+    # --- Run evaluation (no Store, no authoring) ------------------------------
+    evaluator = _EvalRunner(
+        model=model,
+        api_key=api_key,
+        judge_model=_judge_model,
+        judge_api_key=_judge_api_key,
+        scripts_enabled=scripts_enabled,
+        usage=usage,
+    )
+    skill = await evaluator.run(skill, eval_cases)
+    skill.usage = usage
+    return skill
+
+
+class _EvalRunner:
+    """Lightweight evaluation-only runner (no Store, no authoring)."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        judge_model: str,
+        judge_api_key: str,
+        scripts_enabled: bool,
+        usage: TokenUsage,
+    ):
+        self.model = model
+        self.api_key = api_key
+        self.judge_model = judge_model
+        self.judge_api_key = judge_api_key
+        self.scripts_enabled = scripts_enabled
+        self.usage = usage
+
+    async def run(self, skill: Skill, eval_cases: list[EvalCase]) -> Skill:
+        """Run baseline vs with-skill comparison."""
+        skill_dir = skill.dir
+        with_skill_coros = [
+            self._run_one(c, skill_dir=skill_dir)
+            for c in eval_cases
+        ]
+        baseline_coros = [
+            self._run_one(c, skill_dir=None)
+            for c in eval_cases
+        ]
+        with_skill_results, baseline_results = await asyncio.gather(
+            asyncio.gather(*with_skill_coros),
+            asyncio.gather(*baseline_coros),
+        )
+        skill.evaluation = Evaluation(
+            with_skill=list(with_skill_results),
+            baseline=list(baseline_results),
+            iter=0,
+        )
+        return skill
+
+    async def _run_one(self, case: EvalCase, *, skill_dir: Path | None) -> EvalResult:
+        """Run a single evaluation case."""
+        tools: list = []
+        if self.scripts_enabled:
+            tools.extend([Python(), Bash()])
+        if skill_dir is not None:
+            tools.append(ClaudeSkill(str(skill_dir)))
+        conv = chak.Conversation(self.model, self.api_key, tools=tools)
+        t0 = time.time()
+        try:
+            resp = await conv.asend(case.input)
+            output = resp.content
+            in_tok, out_tok = io_tokens(resp)
+            cap_hit = False
+        except Exception as e:
+            if "Max tool call iterations" not in str(e):
+                raise
+            output = f"[cap-exceeded] {e}"
+            in_tok, out_tok = 0, 0
+            cap_hit = True
+        latency_ms = int((time.time() - t0) * 1000)
+        self.usage.eval_arms.add_conv(conv)
+        if cap_hit:
+            return EvalResult(
+                case=case, output=output, passed=False,
+                input_tokens=in_tok, output_tokens=out_tok, latency_ms=latency_ms,
+            )
+        passed, judge_conv = await llm_judge(
+            output, case, self.judge_model, self.judge_api_key
+        )
+        self.usage.judging.add_conv(judge_conv)
+        return EvalResult(
+            case=case, output=output, passed=passed,
+            input_tokens=in_tok, output_tokens=out_tok, latency_ms=latency_ms,
+        )
+
+
 class Kraft:
     """Mid-level API: configurable skill generation and verification engine."""
 
@@ -122,7 +305,7 @@ class Kraft:
         model: str,
         *,
         skill_dir: str | Path,
-        api_key: str | None = None,
+        api_key: str,
         judge_model: str | None = None,
         judge_api_key: str | None = None,
         overwrite: bool = False,
@@ -133,19 +316,22 @@ class Kraft:
         scripts_enabled: bool = False,
     ):
         self.model = model
-        self.api_key = api_key or self._resolve_api_key(model)
+        self.api_key = api_key
         self.judge_model = judge_model or model
 
-        # Judge api_key: three-tier fallback so cross-provider judges work.
-        #   1. explicit `judge_api_key`        → use it
-        #   2. judge_model == model            → reuse self.api_key
-        #   3. cross-provider                  → resolve from environment
+        # Judge api_key: caller must be explicit about cross-provider judges.
+        # Same-provider reuse is the only implicit path — a deliberate
+        # convenience; cross-provider must come in via ``judge_api_key``.
         if judge_api_key is not None:
             self.judge_api_key = judge_api_key
         elif self.judge_model == self.model:
             self.judge_api_key = self.api_key
         else:
-            self.judge_api_key = self._resolve_api_key(self.judge_model)
+            raise ValueError(
+                f"judge_model={self.judge_model!r} differs from model={self.model!r}; "
+                "pass judge_api_key explicitly (the library does not resolve "
+                "keys from the environment)."
+            )
 
         self.thresholds = thresholds or Thresholds(max_iter=max_iter)
         self._evaluator = evaluator or llm_judge
@@ -162,30 +348,26 @@ class Kraft:
         self.store = Store(Path(skill_dir), overwrite=overwrite)
         self.skill_dir = self.store.skill_dir
 
-    @staticmethod
-    def _resolve_api_key(model: str) -> str:
-        """Resolve API key from environment based on model provider."""
-        import os
-        provider = model.split("/")[0] if "/" in model else model
-        env_map = {
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY",
-        }
-        env_var = env_map.get(provider, f"{provider.upper()}_API_KEY")
-        key = os.environ.get(env_var, "")
-        if not key:
-            raise ValueError(f"No api_key provided and {env_var} not set in environment")
-        return key
-
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     async def run(self, *, task: str | None = None, trace: str | None = None) -> Skill:
-        """Full loop: generate → evaluate → refine → decide."""
+        """Full loop: elaborate → generate → evaluate → refine → decide."""
         assert task or trace, "At least one of task or trace must be provided"
         run_dir = self.store.create_run_dir()
         self._run_dir = run_dir
+        # All conversation logs land here, mirroring the iter_<n>/ layout so
+        # case_gen / authoring / eval_arms / judging can be cross-referenced
+        # against per-iter artifacts. See _dump_conv().
+        self._messages_dir = run_dir / "messages"
+        self._messages_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 0: elaborate the user's brief task into a structured spec.
+        # This is always run — if the task is already detailed, elaboration
+        # normalises format and fills minor gaps at negligible token cost.
+        if task:
+            task = await self._elaborate_task(task)
 
         eval_cases = await self.make_cases(task=task, trace=trace)
         self.store.save_cases(run_dir, eval_cases)
@@ -236,10 +418,33 @@ class Kraft:
             # primary, non-historical location). final_skill currently points
             # at iter_<n>/skill_dir/ inside history; rebinding gives the
             # caller a Skill whose `.dir` is the path they asked for.
-            rebound = Skill.from_dir(self.skill_dir)
+            rebound = Skill.from_dir(self.skill_dir, strict=False)
             rebound.evaluation = final_skill.evaluation
             rebound.usage = self.usage
             return rebound
+
+    # ------------------------------------------------------------------
+    # Spec elaboration (pipeline step 0)
+    # ------------------------------------------------------------------
+
+    async def _elaborate_task(self, task: str) -> str:
+        """Expand a brief task into a structured spec via a single LLM call.
+
+        The elaborated spec replaces the raw user task for all downstream
+        phases (case_gen, author, refine).  It is persisted to
+        ``<run_dir>/spec.md`` and its conversation log to
+        ``<run_dir>/messages/elaboration.json`` for audit.
+        """
+        prompt = P.elaborate_task(task=task, scripts_enabled=self.scripts_enabled)
+        conv = chak.Conversation(self.model, self.api_key)
+        resp = await conv.asend(prompt)
+        elaborated = resp.content
+        # Persist the elaborated spec as a readable Markdown file.
+        (self._run_dir / "spec.md").write_text(elaborated, encoding="utf-8")
+        # Token accounting + message dump.
+        self.usage.spec_elab.add_conv(conv)
+        _dump_conv(conv, self._messages_dir / "elaboration.json")
+        return elaborated
 
     # ------------------------------------------------------------------
     # Authoring (agentic): generate / refine
@@ -276,8 +481,8 @@ class Kraft:
                 scripts_enabled=self.scripts_enabled,
             )
 
-        await self._run_author_agent(prompt, out_dir)
-        return Skill.from_dir(out_dir)
+        await self._run_author_agent(prompt, out_dir, dump_label="authoring")
+        return Skill.from_dir(out_dir, strict=False)
 
     async def refine(self, skill: Skill, *, out_dir: Path) -> Skill:
         """Refine a skill: copy prev → out_dir, then let the agent edit in place."""
@@ -305,10 +510,10 @@ class Kraft:
             scripts_enabled=self.scripts_enabled,
         )
 
-        await self._run_author_agent(prompt, out_dir)
-        return Skill.from_dir(out_dir)
+        await self._run_author_agent(prompt, out_dir, dump_label="authoring")
+        return Skill.from_dir(out_dir, strict=False)
 
-    async def _run_author_agent(self, prompt: str, work_dir: Path) -> None:
+    async def _run_author_agent(self, prompt: str, work_dir: Path, *, dump_label: str = "authoring") -> None:
         """Drive the author/refiner agent.
 
         Tool set is gated by ``scripts_enabled``:
@@ -319,6 +524,10 @@ class Kraft:
         header for rationale. If the cap is reached, the partially-written
         SKILL.md on disk still flows into evaluation; we swallow the exception
         rather than crash the run.
+
+        ``work_dir`` doubles as the iter-anchored location for the message dump
+        — we drop ``messages/iter_<n>/<dump_label>.json`` next to the iter's
+        skill_dir so the audit trail tracks the iteration tree.
         """
         tools: list = [FileSystem(workdir=str(work_dir))]
         if self.scripts_enabled:
@@ -331,9 +540,13 @@ class Kraft:
             # by message to avoid swallowing genuine errors.
             if "Max tool call iterations" not in str(e):
                 raise
-        # Fold authoring cost into run-level usage. conv.stats() works even
-        # when the cap was hit — we still paid for those tokens.
-        self.usage.authoring += conv.stats()["total_tokens"]
+        # Fold authoring cost into run-level usage with input/output split.
+        # conv.stats() works even when the cap was hit — we still paid for
+        # those tokens.
+        self.usage.authoring.add_conv(conv)
+        # Persist the full message log under <run>/messages/iter_<n>/<label>.json
+        iter_name = work_dir.parent.name  # e.g. "iter_0"
+        _dump_conv(conv, self._messages_dir / iter_name / f"{dump_label}.json")
 
     # ------------------------------------------------------------------
     # Test case generation
@@ -344,8 +557,9 @@ class Kraft:
     ) -> list[EvalCase]:
         """Generate evaluation cases (corner-case-biased)."""
         if task:
-            cases_, tokens = await cases.from_task(task, self.model, self.api_key, n=self.n_cases)
-            self.usage.case_gen += tokens
+            cases_, conv = await cases_mod.from_task(task, self.model, self.api_key, n=self.n_cases)
+            self.usage.case_gen.add_conv(conv)
+            _dump_conv(conv, self._messages_dir / "case_gen.json")
             return cases_
         # trace-only path requires Phase 4 (trace.py)
         raise NotImplementedError("Trace-only case generation requires Phase 4 (trace.py)")
@@ -359,8 +573,14 @@ class Kraft:
         # skill.dir is already on disk (generate/refine wrote it there).
         skill_dir = skill.dir
 
-        with_skill_coros = [self._run_one(c, skill_dir=skill_dir) for c in eval_cases]
-        baseline_coros = [self._run_one(c, skill_dir=None) for c in eval_cases]
+        with_skill_coros = [
+            self._run_one(c, idx=i, arm="with_skill", iter=iter, skill_dir=skill_dir)
+            for i, c in enumerate(eval_cases)
+        ]
+        baseline_coros = [
+            self._run_one(c, idx=i, arm="baseline", iter=iter, skill_dir=None)
+            for i, c in enumerate(eval_cases)
+        ]
 
         with_skill, baseline = await asyncio.gather(
             asyncio.gather(*with_skill_coros),
@@ -374,7 +594,15 @@ class Kraft:
         )
         return skill
 
-    async def _run_one(self, case: EvalCase, *, skill_dir: Path | None) -> EvalResult:
+    async def _run_one(
+        self,
+        case: EvalCase,
+        *,
+        idx: int,
+        arm: str,
+        iter: int,
+        skill_dir: Path | None,
+    ) -> EvalResult:
         """Run a single evaluation case.
 
         Tool injection is gated by ``self.scripts_enabled`` so the evaluation
@@ -388,7 +616,12 @@ class Kraft:
 
         This keeps lift attribution clean and aligned with how the developer
         intends to ship the skill.
+
+        ``arm`` ("with_skill" | "baseline") and ``idx`` are used purely to
+        name the dumped message logs; both candidate-arm and judge
+        conversations land under ``messages/iter_<n>/`` for audit.
         """
+        msg_dir = self._messages_dir / f"iter_{iter}"
         tools: list = []
         if self.scripts_enabled:
             tools.extend([Python(), Bash()])
@@ -405,35 +638,40 @@ class Kraft:
         try:
             resp = await conv.asend(case.input)
             output = resp.content
-            tokens = total_tokens(resp)
+            in_tok, out_tok = io_tokens(resp)
             cap_hit = False
         except Exception as e:
             if "Max tool call iterations" not in str(e):
                 raise
             output = f"[cap-exceeded] {e}"
-            tokens = 0
+            in_tok, out_tok = 0, 0
             cap_hit = True
         latency_ms = int((time.time() - t0) * 1000)
         # Account candidate-arm tokens (with_skill or baseline) under eval_arms,
-        # including partial usage from a cap-aborted run.
-        self.usage.eval_arms += conv.stats()["total_tokens"]
+        # with input/output split for accurate cost reporting. Includes partial
+        # usage from a cap-aborted run.
+        self.usage.eval_arms.add_conv(conv)
+        _dump_conv(conv, msg_dir / f"eval_{arm}_case_{idx}.json")
         if cap_hit:
             return EvalResult(
                 case=case,
                 output=output,
                 passed=False,
-                tokens=tokens,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
                 latency_ms=latency_ms,
             )
-        passed, judge_tokens = await self._evaluator(
+        passed, judge_conv = await self._evaluator(
             output, case, self.judge_model, self.judge_api_key
         )
-        self.usage.judging += judge_tokens
+        self.usage.judging.add_conv(judge_conv)
+        _dump_conv(judge_conv, msg_dir / f"judge_{arm}_case_{idx}.json")
         return EvalResult(
             case=case,
             output=output,
             passed=passed,
-            tokens=tokens,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
             latency_ms=latency_ms,
         )
 

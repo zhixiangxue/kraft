@@ -91,25 +91,27 @@ description: <one line, ≤ 200 chars — when to invoke this skill>
 <methodology body>
 ```
 
-# Optional supporting files
+# Scripts are MANDATORY
 
-Decide **consciously** whether the task benefits from extras:
+Because this skill is configured with `scripts_enabled=True`, you MUST
+produce at least one executable script in `scripts/`. The primary
+deliverable is **working code**, not just prose.
 
-- `scripts/*.py` — when the task has a deterministic checker or normalizer
-  (e.g. cron syntax check, JSON-schema validation, unit conversion).
-  Reference them explicitly from SKILL.md.
-- `references/*.md` — when the task needs domain knowledge too long to
-  inline (lookup tables, spec excerpts, vocabulary).
-- `examples/*.md` — when concrete worked examples teach better than rules.
+- `scripts/*.py` — the main tool(s) implementing the task (CLI, validator,
+  converter, etc.). The consumer will invoke these directly.
+- `references/*.md` — optional domain data too long to inline.
+- `examples/*.md` — optional worked examples.
 
-If the task is pure prose methodology, **just SKILL.md is fine** — don't pad.
+SKILL.md should reference the scripts by relative path and document
+their CLI interface (arguments, expected I/O, usage examples).
 
 # Authoring guidelines
 
 - Anticipate failure modes; counter each with a rule, an example, or a script.
-- For deterministic transformations, a small Python validator beats prose
-  rules. Write it. Test it with python before declaring done.
-- Keep SKILL.md focused on *methodology*. Push raw data into references/.
+- For deterministic transformations, a Python script beats prose rules. Write
+  it. Test it with python before declaring done.
+- Keep SKILL.md focused on *methodology + usage docs*. Push implementation
+  into scripts/.
 - Cross-reference supporting files from SKILL.md by relative path.
 """
 
@@ -320,6 +322,88 @@ Apply the change.
 
 
 # =====================================================================
+# Spec elaboration (pipeline step 0 — always runs)
+# =====================================================================
+
+
+def elaborate_task(*, task: str, scripts_enabled: bool) -> str:
+    """Expand a brief user task into a structured internal spec.
+
+    This is the first stage of the kraft pipeline: the user passes a short
+    description (possibly a single sentence), and this prompt asks the LLM
+    to fill in the standard sections that make a skill-authoring task
+    unambiguous.  The elaborated spec is then used as the canonical task
+    for case generation and skill authoring.
+
+    The prompt is designed to be *additive* — if the user already provided
+    a detailed task, the model should preserve it and only fill gaps.
+    """
+    mode_hint = (
+        "The skill MUST include executable scripts (Python CLI tools, validators, "
+        "converters) in a `scripts/` directory, referenced from SKILL.md. "
+        "The primary deliverable is working code in `scripts/`, not just prose."
+        if scripts_enabled
+        else "The skill is methodology-only (pure SKILL.md, no scripts)."
+    )
+    return f"""\
+You are a requirements engineer. Your job: take the brief task description
+below and expand it into a **structured skill specification** that removes
+all ambiguity for downstream agents.
+
+Brief task:
+
+{task}
+
+Skill mode: {mode_hint}
+
+# Output format
+
+Produce a structured spec covering ALL of the following sections. If the
+brief task already addresses a section fully, preserve its content. If a
+section is genuinely not applicable, write "N/A" with a one-sentence
+explanation.
+
+## 1. Goal (1-2 sentences)
+What does this skill enable a consumer to do?
+
+## 2. I/O contract
+- What input does the consumer provide? (format, type, source)
+- What output should the consumer receive? (format, type, destination)
+
+## 3. Deterministic rules
+List every rule that MUST be applied consistently across invocations.
+Rules must be specific enough that two independent implementations
+would produce identical outputs for the same input. Number them.
+
+## 4. Edge cases & boundary conditions
+List inputs that are likely to trip a capable but imperfect model.
+For each, state the expected behavior.
+
+## 5. Constraints
+- Dependencies (stdlib-only? specific libraries?)
+- Performance (size limits, timeouts)
+- Security (secrets, sandboxing)
+
+## 6. Acceptance criteria
+How can an evaluator verify correctness? What does "pass" look like?
+
+# Guidelines
+
+- **CRITICAL**: Every specific requirement stated in the brief task (file
+  paths, naming conventions, exact rules, format specs) MUST appear
+  VERBATIM in the output spec. Do NOT generalize, paraphrase, or omit
+  them. The spec adds detail — it never removes or softens what the user
+  already specified.
+- Be SPECIFIC — replace vague words ("handle appropriately") with exact
+  behavior descriptions.
+- If the brief task is ambiguous on a point, PICK a reasonable
+  interpretation and state it explicitly. Do NOT leave TBDs.
+- Keep the spec concise but complete. Aim for 200-500 words total.
+- Do NOT include implementation code. This is a spec, not a solution.
+"""
+
+
+# =====================================================================
 # Test-case generation builders (used by cases.py)
 # =====================================================================
 
@@ -372,6 +456,20 @@ Generate exactly {n} evaluation cases. For each case, provide:
 - `why_corner`: brief note on why this case matters (happy-path realism
   OR a specific corner / failure mode it probes)
 
+**Self-containment (CRITICAL):**
+
+Every `input` must be **fully self-contained** — it must include ALL data
+needed to produce the `reference` output. The model under test has NO
+access to external files, databases, URLs, or any resource outside the
+conversation. If the task processes data (CSV, JSON, text), embed a
+concrete example payload INLINE in the `input` field. NEVER reference
+file paths like `/data/foo.csv` or URLs that won't be reachable.
+
+  BAD (references non-existent file):
+    "Convert the CSV at /data/sample.csv to JSON."
+  GOOD (data is inline):
+    "Convert this CSV to typed JSON:\nname,age,active\nAlice,30,true\nBob,,false"
+
 **Mix requirements:**
 
 - **Roughly half must be HAPPY-PATH cases**: realistic, well-formed inputs
@@ -388,6 +486,35 @@ Generate exactly {n} evaluation cases. For each case, provide:
 
 Think carefully about both: what "normal usage" looks like, AND what
 would trip up a capable but imperfect model on the edges.
+"""
+
+
+def structure_cases(*, raw_cases: list[str]) -> str:
+    """Convert raw natural-language case descriptions into structured EvalCase fields.
+
+    Each raw case is a free-form string the user typed (e.g.
+    "convert name,age\\nAlice,30 to JSON, expect [{name:Alice,age:30}]").
+    The LLM extracts (input, reference, criterion) from each.
+    """
+    numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(raw_cases))
+    return f"""\
+You are a test-case structuring assistant. Below is a numbered list of
+evaluation case descriptions written in natural language by a developer.
+
+For EACH item, extract three fields:
+
+- `input`: the exact prompt/question that should be sent to the model under test
+- `reference`: the expected correct output (if the description states or implies one)
+- `criterion`: one sentence describing what "equivalent" means for this case
+
+If a description does NOT contain or imply an expected output, set `reference`
+to an empty string "". Do NOT invent a reference — leave it blank.
+
+Raw case descriptions:
+
+{numbered}
+
+Return exactly {len(raw_cases)} structured cases in the same order.
 """
 
 

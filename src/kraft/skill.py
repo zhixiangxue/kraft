@@ -9,41 +9,102 @@ also takes a directory.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 import frontmatter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Validation constants for skill directories.
+_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_MAX_NAME_LENGTH = 64
+_ALLOWED_ROOT_DIRS = {"scripts", "references", "examples", "assets"}
+_PLACEHOLDER_MARKERS = ("[todo", "todo:")
 
 
-class TokenUsage(BaseModel):
-    """Run-level token accounting, partitioned by phase.
+class PhaseTokens(BaseModel):
+    """Input / output token split for a single accounting bucket.
 
-    Two top-level buckets matching the user-facing mental model:
-      - generation = case_gen + authoring  (everything that *produces* the skill)
-      - evaluation = eval_arms + judging   (everything that *measures* it)
-
-    Sub-buckets are kept so the summary table can break down where the cost
-    actually lands; e.g. heavy ``judging`` vs ``eval_arms`` tells you whether
-    LLM-as-judge or the case runs are dominating evaluation cost.
+    Stored separately because input and output are billed at different
+    unit prices (typically output is 3-5x more expensive). Merging into a
+    single ``total`` would silently lose the cost basis.
     """
 
-    case_gen: int = 0     # cases.from_task / from_trace
-    authoring: int = 0    # _run_author_agent (generate + refine)
-    eval_arms: int = 0    # _run_one (with_skill + baseline answer rounds)
-    judging: int = 0      # llm_judge
-
-    @property
-    def generation(self) -> int:
-        return self.case_gen + self.authoring
-
-    @property
-    def evaluation(self) -> int:
-        return self.eval_arms + self.judging
+    input: int = 0
+    output: int = 0
 
     @property
     def total(self) -> int:
-        return self.generation + self.evaluation
+        return self.input + self.output
+
+    def add(self, input_tokens: int, output_tokens: int) -> None:
+        self.input += int(input_tokens or 0)
+        self.output += int(output_tokens or 0)
+
+    def add_conv(self, conv: Any) -> None:
+        """Fold a chak Conversation's cumulative usage into this bucket."""
+        s = conv.stats()
+        self.add(s.get("input_tokens", 0), s.get("output_tokens", 0))
+
+
+class TokenUsage(BaseModel):
+    """Run-level token accounting, partitioned by phase, with input/output split.
+
+    Three top-level buckets matching the user-facing mental model:
+      - elaboration = spec_elab  (expanding brief task → structured spec)
+      - generation  = case_gen + authoring  (everything that *produces* the skill)
+      - evaluation  = eval_arms + judging   (everything that *measures* it)
+
+    Each bucket is a :class:`PhaseTokens` carrying ``input`` and ``output``
+    counts so callers can apply the correct per-token price (output is
+    typically 3-5x the input rate). Aggregate ``input`` / ``output`` /
+    ``total`` are exposed as properties for reporting.
+    """
+
+    spec_elab: PhaseTokens = Field(default_factory=PhaseTokens)
+    case_gen: PhaseTokens = Field(default_factory=PhaseTokens)
+    authoring: PhaseTokens = Field(default_factory=PhaseTokens)
+    eval_arms: PhaseTokens = Field(default_factory=PhaseTokens)
+    judging: PhaseTokens = Field(default_factory=PhaseTokens)
+
+    @property
+    def elaboration(self) -> PhaseTokens:
+        return self.spec_elab
+
+    @property
+    def generation(self) -> PhaseTokens:
+        return PhaseTokens(
+            input=self.case_gen.input + self.authoring.input,
+            output=self.case_gen.output + self.authoring.output,
+        )
+
+    @property
+    def evaluation(self) -> PhaseTokens:
+        return PhaseTokens(
+            input=self.eval_arms.input + self.judging.input,
+            output=self.eval_arms.output + self.judging.output,
+        )
+
+    @property
+    def input(self) -> int:
+        return (
+            self.spec_elab.input
+            + self.case_gen.input + self.authoring.input
+            + self.eval_arms.input + self.judging.input
+        )
+
+    @property
+    def output(self) -> int:
+        return (
+            self.spec_elab.output
+            + self.case_gen.output + self.authoring.output
+            + self.eval_arms.output + self.judging.output
+        )
+
+    @property
+    def total(self) -> int:
+        return self.input + self.output
 
 
 class EvalCase(BaseModel):
@@ -56,13 +117,23 @@ class EvalCase(BaseModel):
 
 
 class EvalResult(BaseModel):
-    """Result of running a single evaluation case."""
+    """Result of running a single evaluation case.
+
+    Tokens are split into ``input_tokens`` and ``output_tokens`` so callers
+    can compute cost at distinct provider rates. ``tokens`` (the sum) is
+    exposed as a derived property for legacy aggregations.
+    """
 
     case: EvalCase
     output: str  # full raw output, never truncated
     passed: bool
-    tokens: int  # cumulative input + output tokens for the conversation
+    input_tokens: int = 0
+    output_tokens: int = 0
     latency_ms: int
+
+    @property
+    def tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
 
 
 class Evaluation(BaseModel):
@@ -166,8 +237,18 @@ class Skill(BaseModel):
     # ---- factories ---------------------------------------------------------
 
     @classmethod
-    def from_dir(cls, dir: str | Path) -> "Skill":
-        """Bind a Skill to an existing directory containing SKILL.md."""
+    def from_dir(cls, dir: str | Path, *, strict: bool = True) -> "Skill":
+        """Bind a Skill to an existing directory containing SKILL.md.
+
+        When ``strict=True`` (default), full validation is applied:
+          - name must be hyphen-case, ≤64 chars
+          - description must be non-empty and not contain TODO placeholders
+          - root directory may only contain SKILL.md + allowed subdirs
+          - symlinks are rejected
+
+        Pass ``strict=False`` to skip structural checks (e.g. during
+        authoring iterations where the skill is still being written).
+        """
         d = Path(dir).resolve()
         if not d.is_dir():
             raise FileNotFoundError(f"Skill directory not found: {d}")
@@ -180,7 +261,48 @@ class Skill(BaseModel):
             raise ValueError(f"SKILL.md missing 'name' in frontmatter: {d}")
         if not meta.get("description"):
             raise ValueError(f"SKILL.md missing 'description' in frontmatter: {d}")
+
+        if strict:
+            cls._validate_strict(d, meta)
         return skill
+
+    @staticmethod
+    def _validate_strict(d: Path, meta: dict) -> None:
+        """Extended validation: naming, structure, symlinks."""
+        name = str(meta["name"]).strip()
+        description = str(meta["description"]).strip()
+
+        # Name format: hyphen-case, letters/digits/hyphens only.
+        if not _NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Skill name '{name}' must be hyphen-case "
+                "(lowercase letters, digits, and single hyphens only)"
+            )
+        if len(name) > _MAX_NAME_LENGTH:
+            raise ValueError(
+                f"Skill name '{name}' is too long ({len(name)} chars, max {_MAX_NAME_LENGTH})"
+            )
+
+        # Description quality: no TODO placeholders.
+        desc_lower = description.lower()
+        if any(m in desc_lower for m in _PLACEHOLDER_MARKERS):
+            raise ValueError(
+                f"Skill description still contains TODO placeholder text: {d}"
+            )
+        # Root directory: only SKILL.md + allowed subdirectories.
+        for child in d.iterdir():
+            if child.name == "SKILL.md":
+                continue
+            if child.is_symlink():
+                raise ValueError(
+                    f"Symlinks not allowed in skill directory: {child}"
+                )
+            if child.is_dir() and child.name in _ALLOWED_ROOT_DIRS:
+                continue
+            raise ValueError(
+                f"Unexpected item in skill root: '{child.name}'. "
+                f"Allowed: SKILL.md + directories: {sorted(_ALLOWED_ROOT_DIRS)}"
+            )
 
     # ---- views over disk ---------------------------------------------------
 
@@ -220,13 +342,16 @@ class Skill(BaseModel):
         return sorted(out)
 
 
-def total_tokens(resp: Any) -> int:
-    """Extract cumulative input+output tokens from a chak response.
+def io_tokens(resp: Any) -> tuple[int, int]:
+    """Extract (input, output) token counts from a chak response.
 
-    chak accumulates usage across multi-turn tool round-trips.
-    Access via resp.metadata.usage.prompt_tokens / completion_tokens.
+    chak accumulates usage across multi-turn tool round-trips. Access via
+    ``resp.metadata.usage.prompt_tokens`` / ``completion_tokens``.
     """
     usage = getattr(getattr(resp, "metadata", None), "usage", None)
     if usage is None:
-        return 0
-    return (getattr(usage, "prompt_tokens", 0) or 0) + (getattr(usage, "completion_tokens", 0) or 0)
+        return 0, 0
+    return (
+        int(getattr(usage, "prompt_tokens", 0) or 0),
+        int(getattr(usage, "completion_tokens", 0) or 0),
+    )

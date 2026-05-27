@@ -9,8 +9,6 @@ reference comparison is mechanical.
 
 from __future__ import annotations
 
-import os
-
 import chak
 
 from kraft.skill import EvalCase
@@ -40,22 +38,20 @@ async def llm_judge(
     output: str,
     case: EvalCase,
     judge_model: str,
-    api_key: str | None = None,
-) -> tuple[bool, int]:
+    api_key: str,
+) -> tuple[bool, chak.Conversation]:
     """Default evaluator: LLM-as-judge with binary yes/no output.
 
     Uses a separate LLM call with a compressed yes/no output space for
     consistency. The same judge evaluates both baseline and with-skill arms
     so judge bias cancels out in the lift signal.
 
-    Returns ``(passed, tokens_used)`` so the caller can fold judge cost into
-    run-level usage accounting (separately from the candidate-arm cost).
+    Returns ``(passed, conv)`` so the caller can both fold the judge's
+    input/output token usage into run-level accounting *and* dump the
+    judge conversation for audit. ``api_key`` is required — the library
+    does not consult environment variables; the caller passes whatever
+    credential it sourced.
     """
-    if api_key is None:
-        provider = judge_model.split("/")[0] if "/" in judge_model else judge_model
-        env_map = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-        env_var = env_map.get(provider, f"{provider.upper()}_API_KEY")
-        api_key = os.environ.get(env_var, "")
     prompt = JUDGE_PROMPT.format(
         input=case.input,
         reference=case.reference,
@@ -65,4 +61,4 @@ async def llm_judge(
     conv = chak.Conversation(judge_model, api_key)
     resp = await conv.asend(prompt)
     passed = resp.content.strip().lower().startswith("yes")
-    return passed, conv.stats()["total_tokens"]
+    return passed, conv
